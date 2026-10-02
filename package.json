@@ -1,0 +1,27 @@
+{
+  "name": "mofox-voice-assistant",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["apps/*", "packages/*"],
+  "overrides": { "gh-pages": "^6.3.0", "tsup": { "esbuild": "^0.28.2" } },
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "dev": "concurrently -k -n server,web \"npm run dev -w @mofox/server\" \"npm run dev -w @mofox/web\"",
+    "build": "npm run check && npm run build -w @mofox/web && npm run build -w @mofox/server",
+    "start": "npm run start -w @mofox/server",
+    "check": "tsc -p tsconfig.scripts.json && npm run check -w @mofox/protocol && npm run check -w @mofox/server && npm run check -w @mofox/web",
+    "test": "tsx --test tests/*.test.ts",
+    "setup": "tsx scripts/setup.ts",
+    "https": "tsx scripts/https.ts",
+    "plugin:install": "tsx scripts/install-plugin.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@peculiar/x509": "^2.1.0",
+    "reflect-metadata": "^0.2.2",
+    "concurrently": "^9.2.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}

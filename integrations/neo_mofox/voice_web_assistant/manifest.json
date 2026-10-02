@@ -1,0 +1,18 @@
+{
+  "name": "voice_web_assistant",
+  "version": "0.1.0",
+  "description": "本地 Vue 网页语音助手与 Neo-MoFox 的平台桥接",
+  "author": "Voice Assistant Project",
+  "dependencies": {
+    "plugins": ["default_chatter"],
+    "components": ["default_chatter:service:chat_core"]
+  },
+  "include": [
+    {"component_type": "adapter", "component_name": "voice_web", "dependencies": [], "enabled": true},
+    {"component_type": "chatter", "component_name": "voice_web_chatter", "dependencies": ["default_chatter:service:chat_core"], "enabled": true}
+  ],
+  "entry_point": "plugin.py",
+  "api_version": {"log_api": "1.0.0", "service_api": "1.0.0", "stream_api": "1.0.0", "config_api": "1.0.0"},
+  "python_dependencies": [],
+  "dependencies_required": true
+}

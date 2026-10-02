@@ -1,0 +1,3 @@
+{"type":"bridge.hello","version":1}
+{"type":"chat.submit","version":1,"sessionId":"example-session","userId":"voice:example-session","turnId":"example-turn","messageId":"example-input","text":"你好，介绍一下你自己","nickname":"网页用户"}
+{"type":"chat.cancel","sessionId":"example-session","turnId":"example-turn"}
