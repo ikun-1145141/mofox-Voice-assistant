@@ -32,6 +32,19 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
   const tts = new GsvTts(() => config, dataRoot);
   let speech = new SpeechEngine(config.speech, config.wakePhrase);
   let shuttingDown = false;
+  const backgroundTasks = new Set<Promise<void>>();
+  function background(run: () => Promise<unknown>): void {
+    if (shuttingDown) return;
+    let task: Promise<void>;
+    try {
+      // Start immediately so a reply owns its synthesis before a terminal event.
+      task = Promise.resolve(run()).then(() => {}, error => {
+        app.log.error({ err: error }, '后台任务执行失败');
+      });
+    } catch (error) { app.log.error({ err: error }, '后台任务执行失败'); return; }
+    backgroundTasks.add(task);
+    void task.then(() => { backgroundTasks.delete(task); });
+  }
   const peers = new Map<string, WebSocket>();
   const resumeWake = new Map<string, () => void>();
   const pairAttempts = new Map<string, { count: number; reset: number }>();
@@ -40,7 +53,11 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
   const corePath = path.join(dataRoot, 'vendor/live2dcubismcore.min.js');
   const coreExists = async () => { try { await access(corePath); return true; } catch { return false; } };
   async function sendSessionReady(session: Session) {
-    session.send({ type: 'session.ready', data: { sessionId: session.id, clientId: session.clientId, admin: session.admin, settings: publicSettings(config, session.admin, await coreExists()), models: await models.list() } });
+    if (shuttingDown) return;
+    const core = await coreExists();
+    if (shuttingDown) return;
+    const list = await models.list();
+    if (!shuttingDown) session.send({ type: 'session.ready', data: { sessionId: session.id, clientId: session.clientId, admin: session.admin, settings: publicSettings(config, session.admin, core), models: list } });
   }
 
   async function status(session?: Session): Promise<StatusResponse> {
@@ -51,8 +68,11 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
       live2dCore: { ready: core, detail: core ? 'Cubism Core 已就绪' : '请在设置中导入官方 Cubism Core' }, models: (await models.list()).length };
   }
   async function broadcastStatus() {
-    if (shuttingDown) return;
-    for (const session of sessions.all()) session.send({ type: 'status.changed', data: await status(session) });
+    for (const session of sessions.all()) {
+      if (shuttingDown) return;
+      const data = await status(session);
+      if (!shuttingDown) session.send({ type: 'status.changed', data });
+    }
   }
   function maybeFinished(session: Session, turn: Turn) {
     if (session.turn !== turn || !turn.coreFinished || turn.pendingSynthesis !== 0 || turn.pendingPlayback.size !== 0) return;
@@ -96,7 +116,7 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
       if (config.tts.enabled) {
         const segments = speechSegments(event.text, turn.id, nextIndex.get(turn.id) ?? 0);
         nextIndex.set(turn.id, (nextIndex.get(turn.id) ?? 0) + segments.length);
-        for (const segment of segments) void synthesize(session, turn, segment);
+        for (const segment of segments) background(() => synthesize(session, turn, segment));
       }
     } else {
       turn.coreFinished = true;
@@ -117,13 +137,14 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
         // A new private identity prevents a retired core stream contaminating
         // the next request when the transport cannot deliver its terminal event.
         await sessions.renew(session);
+        if (shuttingDown) return;
         await sendSessionReady(session);
       }
     }
     await broadcastStatus();
   }
-  const bridge = new NeoBridge(config.bridge.port, config.bridge.token, onBridgeEvent, () => { void onBridgeStatus(); });
-  void speech.ready.then(broadcastStatus);
+  const bridge = new NeoBridge(config.bridge.port, config.bridge.token, onBridgeEvent, () => { background(onBridgeStatus); });
+  background(() => speech.ready.then(broadcastStatus));
 
   function submit(session: Session, text: string, submissionId: string) {
     if (session.seen.has(submissionId)) return;
@@ -178,7 +199,7 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
     }
     config = updated; await saveConfig(config);
     await speech.close(); speech = new SpeechEngine(config.speech, config.wakePhrase);
-    void speech.ready.then(broadcastStatus);
+    background(() => speech.ready.then(broadcastStatus));
     // Reconnect so each browser gets a stream from the new recognizer instance.
     for (const socket of peers.values()) socket.close(4002, '语音配置已更新，请重新连接');
     await tts.probe(); await broadcastStatus();
@@ -242,8 +263,9 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
     });
     resumeWake.set(session.tokenHash, () => { if (mode === 'kws' && streaming && peers.get(session.tokenHash) === socket) speechSession.start('kws'); });
     const ready = () => sendSessionReady(session);
-    void ready(); void status(session).then(data => session.send({ type: 'status.changed', data }));
-    socket.on('message', async (raw, binary) => {
+    background(ready);
+    background(async () => { const data = await status(session); if (!shuttingDown) session.send({ type: 'status.changed', data }); });
+    socket.on('message', (raw, binary) => background(async () => {
       try {
         if (binary) {
           if (!streaming) return;
@@ -269,7 +291,7 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
           case 'session.new': if (session.turn) { const turn = session.turn; failPlayback(session, turn, '会话已切换'); nextIndex.delete(turn.id); } await sessions.renew(session); await ready(); break;
         }
       } catch (e) { speechSession.stop(); streaming = false; session.send({ type: 'error', code: 'invalid_message', message: (e as Error).message }); }
-    });
+    }));
     socket.on('close', () => {
       speechSession.stop();
       if (peers.get(session.tokenHash) === socket) {
@@ -284,9 +306,18 @@ export async function createApplication(initialConfig: AppConfig, dataRoot = DAT
   const webRoot = path.join(ROOT, 'apps/web/dist');
   try { await access(webRoot); await app.register(staticFiles, { root: webRoot, prefix: '/' }); }
   catch { app.get('/', (_request, reply) => reply.type('text/plain; charset=utf-8').send('网页尚未构建，请运行 npm run build，或 npm run dev 后访问 http://localhost:5180。')); }
-  const healthTimer = setInterval(() => { void tts.probe().then(broadcastStatus); void tts.clean(); for (const [key, value] of pairAttempts) if (value.reset < Date.now()) pairAttempts.delete(key); }, 15000);
-  healthTimer.unref(); void tts.probe();
-  app.addHook('onClose', async () => { shuttingDown = true; clearInterval(healthTimer); for (const socket of peers.values()) socket.terminate(); for (const session of sessions.all()) if (session.turn) { session.turn.abort.abort(); if (session.turn.timeout) clearTimeout(session.turn.timeout); } await speech.close(); await bridge.close(); });
+  const healthTimer = setInterval(() => { background(() => tts.probe().then(broadcastStatus)); background(() => tts.clean()); for (const [key, value] of pairAttempts) if (value.reset < Date.now()) pairAttempts.delete(key); }, 15000);
+  healthTimer.unref(); background(() => tts.probe());
+  app.addHook('onClose', async () => {
+    shuttingDown = true;
+    clearInterval(healthTimer);
+    for (const socket of peers.values()) socket.terminate();
+    for (const session of sessions.all()) if (session.turn) { session.turn.abort.abort(); if (session.turn.timeout) clearTimeout(session.turn.timeout); }
+    await speech.close();
+    await bridge.close();
+    while (backgroundTasks.size) await Promise.all([...backgroundTasks]);
+    await tts.close();
+  });
   return { app, bridge, sessions, models, tts, getConfig: () => config };
 }
 

@@ -71,4 +71,6 @@ export class GsvTts {
       if (info?.isFile() && info.mtimeMs < Date.now() - 10 * 60 * 1000) await unlink(file).catch(() => {});
     }
   }
+  /** Public cancellation may finish before its serial queue job; join both. */
+  async close(): Promise<void> { await this.queue; }
 }

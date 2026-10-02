@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { once } from 'node:events';
 import { createServer } from 'node:net';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { WebSocket } from 'ws';
@@ -120,4 +120,76 @@ test('opening a second page retires audio that only the first page could acknowl
   await page();
   assert.equal(abort.signal.aborted, true);
   assert.equal(session.turn, null);
+});
+
+test('a reply and terminal event in the same socket delivery retain pending speech', { timeout: 5000 }, async t => {
+  const data = await mkdtemp(path.join(tmpdir(), 'voice-terminal-speech-'));
+  const config = defaultConfig(); config.speech.enabled = false; config.tts.enabled = true; config.bridge.port = await freePort();
+  const { app, bridge, sessions, tts } = await createApplication(config, data);
+  const address = await app.listen({ port: 0, host: '127.0.0.1' });
+  let release!: () => void;
+  const synthesis = new Promise<void>(resolve => { release = resolve; });
+  tts.synthesize = async () => { await synthesis; return '/api/audio/gated-segment'; };
+  const sockets: WebSocket[] = [];
+  t.after(async () => { release(); sockets.forEach(socket => socket.terminate()); await app.close(); await rm(data, { recursive: true, force: true }); });
+  const neoWs = new WebSocket(`ws://127.0.0.1:${config.bridge.port}/bridge`, { headers: { Authorization: `Bearer ${config.bridge.token}` } }); sockets.push(neoWs);
+  const neo = new Inbox(neoWs); const hello = neo.next('bridge.hello'); await once(neoWs, 'open'); await hello;
+  neo.send({ type: 'bridge.ready', version: 1, botName: '测试核心', capabilities: ['text', 'turn-completion'] });
+  const paired = await app.inject({ method: 'POST', url: '/api/pair', payload: { code: config.security.pairCode } });
+  const ws = new WebSocket(address.replace('http', 'ws') + '/ws', { headers: { cookie: `assistant_session=${paired.cookies[0]!.value}` } }); sockets.push(ws);
+  const device = new Inbox(ws); const ready = device.next('session.ready'); await once(ws, 'open'); await ready;
+  const submitted = neo.next('chat.submit'); device.send({ type: 'text.submit', text: '请说一句话', submissionId: 'same-delivery' });
+  const submittedTurn = await submitted;
+  const owner = [...sessions.all()].find(session => session.id === submittedTurn.sessionId)!;
+  const turn = owner.turn!;
+  // ws can emit multiple decoded frames synchronously from one TCP packet.
+  const transport = (bridge as unknown as { socket: WebSocket }).socket;
+  const audio = device.next('audio.ready');
+  transport.emit('message', Buffer.from(JSON.stringify({ type: 'bot.message', sessionId: owner.id, turnId: turn.id, messageId: 'same-delivery-reply', text: '这是完整回复。' })), false);
+  transport.emit('message', Buffer.from(JSON.stringify({ type: 'turn.completed', sessionId: owner.id, turnId: turn.id })), false);
+  assert.equal(turn.pendingSynthesis, 1, 'synthesis must reserve the turn before a terminal frame can release it');
+  assert.equal(turn.coreFinished, true);
+  assert.equal(owner.turn, turn);
+  release();
+  const delivered = await audio;
+  assert.equal(delivered.segment.text, '这是完整回复。');
+  assert.equal(turn.pendingPlayback.has(delivered.segment.segmentId), true);
+  assert.equal(owner.turn, turn, 'audio still requires a playback acknowledgement');
+  const idle = device.next('state.changed'); device.send({ type: 'playback.finished', segmentId: delivered.segment.segmentId });
+  assert.equal((await idle).state, 'idle');
+  assert.equal(owner.turn, null);
+});
+
+test('server shutdown waits for an in-flight bridge status read before data cleanup', { timeout: 5000 }, async t => {
+  const data = await mkdtemp(path.join(tmpdir(), 'voice-shutdown-'));
+  const config = defaultConfig(); config.speech.enabled = false; config.bridge.port = await freePort();
+  const { app, bridge, sessions, models } = await createApplication(config, data);
+  await app.ready();
+  await sessions.create(false);
+  let entered!: () => void, release!: () => void, stopped!: () => void;
+  const reading = new Promise<void>(resolve => { entered = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const producersStopped = new Promise<void>(resolve => { stopped = resolve; });
+  const list = models.list.bind(models);
+  let readFinished = false;
+  models.list = async () => { entered(); await gate; const rows = await list(); readFinished = true; return rows; };
+  const closeBridge = bridge.close.bind(bridge);
+  bridge.close = async () => { await closeBridge(); stopped(); };
+  const ws = new WebSocket(`ws://127.0.0.1:${config.bridge.port}/bridge`, { headers: { Authorization: `Bearer ${config.bridge.token}` } });
+  t.after(async () => { release(); ws.terminate(); await app.close(); await rm(data, { recursive: true, force: true }); });
+  const neo = new Inbox(ws); const hello = neo.next('bridge.hello'); await once(ws, 'open'); await hello;
+  neo.send({ type: 'bridge.ready', version: 1, botName: '测试核心', capabilities: ['text', 'turn-completion'] });
+  await reading;
+  let closed = false;
+  const closing = app.close().then(() => { closed = true; });
+  try {
+    await producersStopped;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(closed, false, 'close must wait while the background filesystem read is blocked');
+  } finally { release(); }
+  await closing;
+  assert.equal(readFinished, true, 'the filesystem read must finish before close resolves');
+  await rm(data, { recursive: true, force: true });
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await assert.rejects(access(data), { code: 'ENOENT' });
 });
